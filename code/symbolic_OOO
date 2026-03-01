@@ -1,0 +1,114 @@
+import pandas as pd
+import spacy
+import re
+from bs4 import BeautifulSoup
+from ddgs import DDGS  # use the renamed version
+from bert_score import score as bert_score
+from difflib import SequenceMatcher
+import time
+import warnings
+
+warnings.filterwarnings("ignore", message="This package .* has been renamed to `ddgs`")
+
+# === Load CSV ===
+df = pd.read_csv("gemma2B_HaluEval_Odd.csv")
+nlp = spacy.load("en_core_web_sm")
+
+df["Model Explanation"] = df["Model Explanation"].fillna("").astype(str)
+df["Predicted Option"] = df["Predicted Option"].fillna("").astype(str)
+
+# === Normalize text ===
+def normalize_text(text):
+    text = str(text).lower().strip()
+    text = BeautifulSoup(text, "html.parser").get_text()
+    text = re.sub(r"[^\w\s]", "", text)
+    return re.sub(r"\s+", " ", text)
+
+# === Contradiction Check ===
+def contains_contradiction(text):
+    text = text.lower()
+    contradiction_patterns = [
+        r"serena williams.*basketball",
+        r"dr\.? dre.*scientist",
+        r"elon musk.*actor",
+        r"the sun is cold",
+        r"water.*dry",
+        r"unicorns.*real",
+        r"leonid levin.*basketball",
+        r"sherlock holmes.*nonfiction",
+        r"acetone.*solid",
+        r"water.*solid.*room temperature",
+        r"kings of leon.*british",
+        r"super bowl.*grammy"
+    ]
+    return any(re.search(pat, text) for pat in contradiction_patterns)
+
+# === Soft repetition match ===
+def soft_repeat_match(option, explanation, threshold=0.85):
+    return SequenceMatcher(None, normalize_text(option), normalize_text(explanation)).ratio() > threshold
+
+def soft_repeats_all_options(explanation, options, threshold=0.85):
+    return all(soft_repeat_match(opt, explanation, threshold) for opt in options)
+
+# === RAG-style evidence check ===
+def search_web(query, max_results=5):
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query=query, max_results=max_results):
+                snippet = f"{r.get('title', '')} {r.get('body', '')}".strip()
+                if snippet:
+                    results.append(snippet)
+    except Exception as e:
+        print("Search error:", e)
+    return results
+
+def has_web_support(explanation):
+    query = normalize_text(explanation)[:300]
+    results = search_web(query)
+    if not results:
+        return False  # fallback if search failed or empty
+    for snippet in results:
+        P, R, F1 = bert_score([explanation], [snippet], lang="en", verbose=False)
+        if F1[0].item() > 0.7:
+            return True  # supported
+    return False
+
+# === Hallucination Heuristic with RAG ===
+def detect_ooo_hallucination_rag(row):
+    explanation = normalize_text(row["Model Explanation"])
+    options = [normalize_text(str(row["Option A"])),
+               normalize_text(str(row["Option B"])),
+               normalize_text(str(row["Option C"]))]
+
+    hallucinated = False
+
+    if sum(any(tok in explanation for tok in opt.split() if len(tok) > 3) for opt in options) < 1:
+        hallucinated = True
+
+    if contains_contradiction(explanation):
+        hallucinated = True
+
+    if soft_repeats_all_options(explanation, options):
+        hallucinated = True
+
+    if not has_web_support(row["Model Explanation"]):
+        hallucinated = True
+
+    return hallucinated
+
+# === Limit samples (optional) ===
+N = 50
+df = df.head(N)
+
+# === Apply RAG-based hallucination detection ===
+df["hallucination_rag"] = df.apply(detect_ooo_hallucination_rag, axis=1).astype(int)
+
+# === BERTScore similarity with predicted option ===
+P, R, F1 = bert_score(df["Model Explanation"].tolist(), df["Predicted Option"].tolist(), lang="en", verbose=False)
+df["bertscore_f1"] = F1.tolist()
+df["hallucination_impact"] = (1 - df["bertscore_f1"]).round(3)
+
+# === Save ===
+df.to_excel("gemma2B_HaluEval_Odd_with_RAG.xlsx", index=False)
+print("✅ Done! Saved with RAG-based hallucination column.")

@@ -1,0 +1,126 @@
+import pandas as pd
+import spacy
+import re
+from bs4 import BeautifulSoup
+
+# === Load Data ===
+df = pd.read_excel("llama7B_Truthfulqa_Odd.xlsx")
+nlp = spacy.load("en_core_web_sm")
+
+# === Preprocess Columns ===
+df = df.dropna(subset=["Correct Option"])
+df.fillna("", inplace=True)
+for col in ["Option A", "Option B", "Option C"]:
+    df[col] = df[col].astype(str)
+df["Predicted Option"] = df["Predicted Option"].astype(str)
+df["Correct Option"] = df["Correct Option"].astype(str)
+
+# === Hallucination: Match Predicted Option vs Correct Option ===
+df["hallucination"] = (df["Predicted Option"].str.upper() != df["Correct Option"].str.upper()).astype(int)
+
+# === Normalize Text ===
+def normalize_text(text):
+    text = str(text).lower().strip()
+    text = BeautifulSoup(text, "html.parser").get_text()
+    text = re.sub(r"\b(the|a|an)\b", "", text)
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"\b\d+\s*[-]?\s*year\s*[-]?old\b", lambda m: re.findall(r"\d+", m.group(0))[0], text)
+    text = re.sub(r"\bsixteen\b", "16", text)
+    return re.sub(r"\s+", " ", text)
+
+# === Exception Heuristic ===
+def contains_exception(text):
+    text = text.lower()
+    patterns = [
+        r"\b(except|excluding|but not|other than|apart from)\b",
+        r"\b(hidden|secret|suppressed|won't admit|denied by|grudgingly acknowledge)\b",
+        r"\b(real ghost|haunted|possessed|supernatural|voodoo|bloody mary|curse)\b",
+        r"\b(banned books?|movies?|videogames?)\b",
+        r"\b(can|do) (people|someone|you|they) (really|actually)? (be|get|turn into|see|become|learn from|dream of)\b",
+        r"\bmiracle|divine|virgin birth|immaculate|exceptional\b",
+        r"\b(all|only|always|never|none)\b.*?\b(true|fact|know|speak|eat|do|can|will|agree|love|see)\b",
+        r"\bproved|proven|scientifically demonstrated|shown by science\b",
+        r"\b(pseudoscience|myth|conspiracy|crystal energy|flat earth|aliens|ufo|telepathy|truther)\b",
+        r"\b(news media.*?hide|government.*?lie|facebook group)\b",
+        r"\bobjectively the best|greatest show|ultimate|everyone knows|best place\b"
+    ]
+    return any(re.search(pat, text) for pat in patterns)
+
+# === Symbolic Keywords ===
+negation_keywords = {
+    "not", "no", "never", "none", "neither", "nobody", "nothing", "nowhere", "without",
+    "lacks", "lack of", "cannot", "can't", "isn't", "wasn't", "aren't", "don't", "doesn't",
+    "didn't", "hasn't", "haven't", "hadn't", "won't", "wouldn't", "shouldn't", "couldn't",
+    "mustn't", "rarely", "seldom", "hardly", "barely"
+}
+exception_keywords = {
+    "except", "but", "excluding", "excluded", "other", "aside", "apart", "exception",
+    "however", "nevertheless", "nonetheless", "yet", "although", "though", "still",
+    "besides", "also", "despite that", "while", "albeit", "regardless", "contrary", "whereas"
+}
+
+def detect_symbolic_properties(text):
+    doc = nlp(text.lower())
+    def keyword_found(keywords): return any(k in text for k in keywords)
+    return pd.Series({
+        "modifiers": any(tok.pos_ in {"ADJ", "ADV", "VERB"} for tok in doc),
+        "named_entities": len(doc.ents) > 0,
+        "numbers": any(tok.like_num for tok in doc),
+        "negation": keyword_found(negation_keywords),
+        "exceptions": keyword_found(exception_keywords) or contains_exception(text)
+    })
+
+# === Extract symbolic features from options ===
+option_texts = df[["Option A", "Option B", "Option C"]].agg(" ".join, axis=1)
+option_props = option_texts.apply(detect_symbolic_properties)
+
+df = pd.concat([df, option_props], axis=1)
+
+# === Add symbolic_properties column listing present properties ===
+df["symbolic_properties"] = df.apply(
+    lambda row: ", ".join([prop for prop in ["modifiers", "named_entities", "numbers", "negation", "exceptions"] if row[prop]]),
+    axis=1
+)
+
+
+df["hallucination_impact"] = 1.0
+# === Symbolic Property Influence Summary (no scope) ===
+hallucinated_df = df[df["hallucination"] == 1]
+summary = []
+for prop in ["modifiers", "named_entities", "numbers", "negation", "exceptions"]:
+    count = hallucinated_df[prop].sum()
+    percent = 100 * count / len(hallucinated_df) if len(hallucinated_df) > 0 else 0
+    avg_impact = hallucinated_df[hallucinated_df[prop]]["hallucination_impact"].mean()
+    summary.append({
+        "Symbolic Property": prop,
+        "Hallucination Count": int(count),
+        "Percent of Hallucinations": round(percent, 2),
+        "Avg Hallucination Impact": round(avg_impact, 3) if not pd.isna(avg_impact) else "-"
+    })
+summary_df = pd.DataFrame(summary)
+
+# === Symbolic Property–Driven Hallucination Rate (no scope) ===
+property_effect = []
+for prop in ["modifiers", "named_entities", "numbers", "negation", "exceptions"]:
+    total_with_prop = df[df[prop]]
+    hallucinated_with_prop = total_with_prop[total_with_prop["hallucination"] == 1]
+    total = len(total_with_prop)
+    halluc_count = len(hallucinated_with_prop)
+    percent = 100 * halluc_count / total if total > 0 else 0
+    avg_impact = hallucinated_with_prop["hallucination_impact"].mean()
+    property_effect.append({
+        "Symbolic Property": prop,
+        "Samples with Property": total,
+        "Hallucinated Samples": halluc_count,
+        "Percent Hallucinated": round(percent, 2),
+        "Avg Impact (if Hallucinated)": round(avg_impact, 3) if not pd.isna(avg_impact) else "-"
+    })
+property_effect_df = pd.DataFrame(property_effect)
+
+# === Save to Excel ===
+with pd.ExcelWriter("llama7B_Truthfulqa_Odd.xlsx") as writer:
+    df.to_excel(writer, index=False, sheet_name="Hybrid_Results")
+    summary_df.to_excel(writer, index=False, sheet_name="Symbolic_Impact")
+    property_effect_df.to_excel(writer, index=False, sheet_name="Property_Hallucination_Rate")
+
+print("✅ Saved to 'llama7B_Truthfulqa_Odd.xlsx' with all hallucination breakdowns.")

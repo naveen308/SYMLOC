@@ -1,0 +1,37 @@
+import pandas as pd
+
+# === 1. Load Excel ===
+df = pd.read_excel("gemma27B_Truthfulqa_QA.xlsx")  # Replace with your actual filename
+
+# === 2. Compute Question Length in Tokens ===
+df["question_length"] = df["Question"].apply(lambda q: len(str(q).split()))
+
+# === 3. Bin by Token Length (10-token intervals) ===
+bins = [0, 10, 20, 30, 40, 50, 100]
+labels = ["0–9", "10–19", "20–29", "30–39", "40–49", "50+"]
+df["length_bin"] = pd.cut(df["question_length"], bins=bins, labels=labels, right=False)
+
+# === 4. Calculate Hallucination % per Symbolic Property ===
+symbolic_properties = ["modifiers", "named_entities", "numbers", "negation", "exceptions"]
+plot_data = []
+
+for prop in symbolic_properties:
+    for bin_label in labels:
+        subset = df[df["length_bin"] == bin_label]
+        if subset.empty:
+            continue
+        total = len(subset)
+        hallucinated = subset[(subset["hallucination"] == 1) & (subset[prop] == True)]
+        percent = 100 * len(hallucinated) / total
+        plot_data.append({
+            "length_bin": bin_label,
+            "symbolic_property": prop,
+            "hallucination_pct": round(percent, 2)
+        })
+
+plot_df = pd.DataFrame(plot_data)
+
+# === 5. Show Table ===
+print("\n=== Hallucination % by Symbolic Property and Question Length ===")
+table = plot_df.pivot(index="length_bin", columns="symbolic_property", values="hallucination_pct").fillna(0)
+print(table)
